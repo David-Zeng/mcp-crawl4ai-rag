@@ -14,6 +14,14 @@ The primary goal is to bring this MCP server into [Archon](https://github.com/co
 
 This MCP server provides tools that enable AI agents to crawl websites, store content in a vector database (Supabase), and perform RAG over the crawled content. It follows the best practices for building MCP servers based on the [Mem0 MCP server template](https://github.com/coleam00/mcp-mem0/) I provided on my channel previously.
 
+The server includes several advanced RAG strategies that can be enabled to enhance retrieval quality:
+- **Contextual Embeddings** for enriched semantic understanding
+- **Hybrid Search** combining vector and keyword search
+- **Agentic RAG** for specialized code example extraction
+- **Reranking** for improved result relevance using cross-encoder models
+
+See the [Configuration section](#configuration) below for details on how to enable and configure these strategies.
+
 ## Vision
 
 The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
@@ -39,12 +47,18 @@ The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
 
 ## Tools
 
-The server provides four essential web crawling and search tools:
+The server provides essential web crawling and search tools:
+
+### Core Tools (Always Available)
 
 1. **`crawl_single_page`**: Quickly crawl a single web page and store its content in the vector database
 2. **`smart_crawl_url`**: Intelligently crawl a full website based on the type of URL provided (sitemap, llms-full.txt, or a regular webpage that needs to be crawled recursively)
 3. **`get_available_sources`**: Get a list of all available sources (domains) in the database
 4. **`perform_rag_query`**: Search for relevant content using semantic search with optional source filtering
+
+### Conditional Tools
+
+5. **`search_code_examples`** (requires `USE_AGENTIC_RAG=true`): Search specifically for code examples and their summaries from crawled documentation. This tool provides targeted code snippet retrieval for AI coding assistants.
 
 ## Prerequisites
 
@@ -121,9 +135,78 @@ TRANSPORT=sse
 # OpenAI API Configuration
 OPENAI_API_KEY=your_openai_api_key
 
+# LLM for summaries and contextual embeddings
+MODEL_CHOICE=gpt-4.1-nano
+
+# RAG Strategies (set to "true" or "false", default to "false")
+USE_CONTEXTUAL_EMBEDDINGS=false
+USE_HYBRID_SEARCH=false
+USE_AGENTIC_RAG=false
+USE_RERANKING=false
+
 # Supabase Configuration
 SUPABASE_URL=your_supabase_project_url
 SUPABASE_SERVICE_KEY=your_supabase_service_key
+```
+
+### RAG Strategy Options
+
+The Crawl4AI RAG MCP server supports four powerful RAG strategies that can be enabled independently:
+
+#### 1. **USE_CONTEXTUAL_EMBEDDINGS**
+When enabled, this strategy enhances each chunk's embedding with additional context from the entire document. The system passes both the full document and the specific chunk to an LLM (configured via `MODEL_CHOICE`) to generate enriched context that gets embedded alongside the chunk content.
+
+- **When to use**: Enable this when you need high-precision retrieval where context matters, such as technical documentation where terms might have different meanings in different sections.
+- **Trade-offs**: Slower indexing due to LLM calls for each chunk, but significantly better retrieval accuracy.
+- **Cost**: Additional LLM API calls during indexing.
+
+#### 2. **USE_HYBRID_SEARCH**
+Combines traditional keyword search with semantic vector search to provide more comprehensive results. The system performs both searches in parallel and intelligently merges results, prioritizing documents that appear in both result sets.
+
+- **When to use**: Enable this when users might search using specific technical terms, function names, or when exact keyword matches are important alongside semantic understanding.
+- **Trade-offs**: Slightly slower search queries but more robust results, especially for technical content.
+- **Cost**: No additional API costs, just computational overhead.
+
+#### 3. **USE_AGENTIC_RAG**
+Enables specialized code example extraction and storage. When crawling documentation, the system identifies code blocks (≥300 characters), extracts them with surrounding context, generates summaries, and stores them in a separate vector database table specifically designed for code search.
+
+- **When to use**: Essential for AI coding assistants that need to find specific code examples, implementation patterns, or usage examples from documentation.
+- **Trade-offs**: Significantly slower crawling due to code extraction and summarization, requires more storage space.
+- **Cost**: Additional LLM API calls for summarizing each code example.
+- **Benefits**: Provides a dedicated `search_code_examples` tool that AI agents can use to find specific code implementations.
+
+#### 4. **USE_RERANKING**
+Applies cross-encoder reranking to search results after initial retrieval. Uses a lightweight cross-encoder model (`cross-encoder/ms-marco-MiniLM-L-6-v2`) to score each result against the original query, then reorders results by relevance.
+
+- **When to use**: Enable this when search precision is critical and you need the most relevant results at the top. Particularly useful for complex queries where semantic similarity alone might not capture query intent.
+- **Trade-offs**: Adds ~100-200ms to search queries depending on result count, but significantly improves result ordering.
+- **Cost**: No additional API costs - uses a local model that runs on CPU.
+- **Benefits**: Better result relevance, especially for complex queries. Works with both regular RAG search and code example search.
+
+### Recommended Configurations
+
+**For general documentation RAG:**
+```
+USE_CONTEXTUAL_EMBEDDINGS=false
+USE_HYBRID_SEARCH=true
+USE_AGENTIC_RAG=false
+USE_RERANKING=true
+```
+
+**For AI coding assistant with code examples:**
+```
+USE_CONTEXTUAL_EMBEDDINGS=true
+USE_HYBRID_SEARCH=true
+USE_AGENTIC_RAG=true
+USE_RERANKING=true
+```
+
+**For fast, basic RAG:**
+```
+USE_CONTEXTUAL_EMBEDDINGS=false
+USE_HYBRID_SEARCH=true
+USE_AGENTIC_RAG=false
+USE_RERANKING=false
 ```
 
 ## Running the Server
