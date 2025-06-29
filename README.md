@@ -4,7 +4,7 @@
   <em>Web Crawling and RAG Capabilities for AI Agents and AI Coding Assistants</em>
 </p>
 
-A powerful implementation of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) integrated with [Crawl4AI](https://crawl4ai.com) and [Supabase](https://supabase.com/) for providing AI agents and AI coding assistants with advanced web crawling and RAG capabilities.
+A powerful implementation of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) integrated with [Crawl4AI](https://crawl4ai.com) and a local PostgreSQL database for providing AI agents and AI coding assistants with advanced web crawling and RAG capabilities.
 
 With this MCP server, you can <b>scrape anything</b> and then <b>use that knowledge anywhere</b> for RAG.
 
@@ -14,7 +14,7 @@ Consider this GitHub repository a testbed, hence why I haven't been super active
 
 ## Overview
 
-This MCP server provides tools that enable AI agents to crawl websites, store content in a vector database (Supabase), and perform RAG over the crawled content. It follows the best practices for building MCP servers based on the [Mem0 MCP server template](https://github.com/coleam00/mcp-mem0/) I provided on my channel previously.
+This MCP server provides tools that enable AI agents to crawl websites, store content in a PostgreSQL vector database, and perform RAG over the crawled content. It follows the best practices for building MCP servers based on the [Mem0 MCP server template](https://github.com/coleam00/mcp-mem0/) I provided on my channel previously.
 
 The server includes several advanced RAG strategies that can be enabled to enhance retrieval quality:
 - **Contextual Embeddings** for enriched semantic understanding
@@ -56,24 +56,34 @@ The server provides essential web crawling and search tools:
 
 1. **`crawl_single_page`**: Quickly crawl a single web page and store its content in the vector database
 2. **`smart_crawl_url`**: Intelligently crawl a full website based on the type of URL provided (sitemap, llms-full.txt, or a regular webpage that needs to be crawled recursively)
-3. **`get_available_sources`**: Get a list of all available sources (domains) in the database
-4. **`perform_rag_query`**: Search for relevant content using semantic search with optional source filtering
+3. **`insert_local_document`**: Inserts content from a local document (text or code) into the RAG database or processes it for the knowledge graph.
+   - **Usage:**
+     ```python
+     await mcp.tool().insert_local_document(
+         file_path="/path/to/your/document.txt",
+         document_type="text", # or "code"
+         source_id="my_local_docs" # Optional custom source ID
+     )
+     ```
+   - **Note for `document_type='code'`:** The knowledge graph is currently designed to parse entire GitHub repositories. Direct insertion of individual local code files is not supported. Use `parse_github_repository` for code from GitHub.
+4. **`get_available_sources`**: Get a list of all available sources (domains) in the database
+5. **`perform_rag_query`**: Search for relevant content using semantic search with optional source filtering
 
 ### Conditional Tools
 
-5. **`search_code_examples`** (requires `USE_AGENTIC_RAG=true`): Search specifically for code examples and their summaries from crawled documentation. This tool provides targeted code snippet retrieval for AI coding assistants.
+6. **`search_code_examples`** (requires `USE_AGENTIC_RAG=true`): Search specifically for code examples and their summaries from crawled documentation. This tool provides targeted code snippet retrieval for AI coding assistants.
 
 ### Knowledge Graph Tools (requires `USE_KNOWLEDGE_GRAPH=true`, see below)
 
-6. **`parse_github_repository`**: Parse a GitHub repository into a Neo4j knowledge graph, extracting classes, methods, functions, and their relationships for hallucination detection
-7. **`check_ai_script_hallucinations`**: Analyze Python scripts for AI hallucinations by validating imports, method calls, and class usage against the knowledge graph
-8. **`query_knowledge_graph`**: Explore and query the Neo4j knowledge graph with commands like `repos`, `classes`, `methods`, and custom Cypher queries
+7. **`parse_github_repository`**: Parse a GitHub repository into a Neo4j knowledge graph, extracting classes, methods, functions, and their relationships for hallucination detection
+8. **`check_ai_script_hallucinations`**: Analyze Python scripts for AI hallucinations by validating imports, method calls, and class usage against the knowledge graph
+9. **`query_knowledge_graph`**: Explore and query the Neo4j knowledge graph with commands like `repos`, `classes`, `methods`, and custom Cypher queries
 
 ## Prerequisites
 
 - [Docker/Docker Desktop](https://www.docker.com/products/docker-desktop/) if running the MCP server as a container (recommended)
 - [Python 3.12+](https://www.python.org/downloads/) if running the MCP server directly through uv
-- [Supabase](https://supabase.com/) (database for RAG)
+- **PostgreSQL with `pgvector` extension**: Your local database for RAG capabilities.
 - [OpenAI API key](https://platform.openai.com/api-keys) (for generating embeddings)
 - [Neo4j](https://neo4j.com/) (optional, for knowledge graph functionality) - see [Knowledge Graph Setup](#knowledge-graph-setup) section
 
@@ -116,21 +126,28 @@ The server provides essential web crawling and search tools:
 
 4. Install dependencies:
    ```bash
-   uv pip install -e .
-   crawl4ai-setup
+   uv pip install .
    ```
 
 5. Create a `.env` file based on the configuration section below
 
 ## Database Setup
 
-Before running the server, you need to set up the database with the pgvector extension:
+Before running the server, you need to set up your local PostgreSQL database with the `pgvector` extension.
 
-1. Go to the SQL Editor in your Supabase dashboard (create a new project first if necessary)
+1.  **Ensure `pgvector` is installed and enabled:**
+    You can use the `check_pgvector.py` script to verify and attempt to install it:
+    ```bash
+    python check_pgvector.py
+    ```
+    (Make sure your `.env` file is configured with your PostgreSQL credentials before running this.)
 
-2. Create a new query and paste the contents of `crawled_pages.sql`
-
-3. Run the query to create the necessary tables and functions
+2.  **Run the schema SQL:**
+    Execute the `crawled_pages.sql` file against your PostgreSQL database to create the necessary tables and functions:
+    ```bash
+    psql -h <DB_HOST> -p <DB_PORT> -U <DB_USER> -d <DB_NAME> -f crawled_pages.sql
+    ```
+    (Replace `<DB_HOST>`, `<DB_PORT>`, `<DB_USER>`, `<DB_NAME>` with your actual database credentials.)
 
 ## Knowledge Graph Setup (Optional)
 
@@ -198,9 +215,12 @@ USE_AGENTIC_RAG=false
 USE_RERANKING=false
 USE_KNOWLEDGE_GRAPH=false
 
-# Supabase Configuration
-SUPABASE_URL=your_supabase_project_url
-SUPABASE_SERVICE_KEY=your_supabase_service_key
+# PostgreSQL Configuration
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=your_db_name
+DB_USER=your_db_user
+DB_PASSWORD=your_db_password
 
 # Neo4j Configuration (required for knowledge graph functionality)
 NEO4J_URI=bolt://localhost:7687
@@ -364,8 +384,11 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "env": {
         "TRANSPORT": "stdio",
         "OPENAI_API_KEY": "your_openai_api_key",
-        "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
+        "DB_HOST": "localhost",
+        "DB_PORT": "5432",
+        "DB_NAME": "your_db_name",
+        "DB_USER": "your_db_user",
+        "DB_PASSWORD": "your_db_password",
         "USE_KNOWLEDGE_GRAPH": "false",
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USER": "neo4j",
@@ -386,8 +409,11 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "args": ["run", "--rm", "-i", 
                "-e", "TRANSPORT", 
                "-e", "OPENAI_API_KEY", 
-               "-e", "SUPABASE_URL", 
-               "-e", "SUPABASE_SERVICE_KEY",
+               "-e", "DB_HOST",
+               "-e", "DB_PORT",
+               "-e", "DB_NAME",
+               "-e", "DB_USER",
+               "-e", "DB_PASSWORD",
                "-e", "USE_KNOWLEDGE_GRAPH",
                "-e", "NEO4J_URI",
                "-e", "NEO4J_USER",
@@ -396,8 +422,11 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "env": {
         "TRANSPORT": "stdio",
         "OPENAI_API_KEY": "your_openai_api_key",
-        "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
+        "DB_HOST": "localhost",
+        "DB_PORT": "5432",
+        "DB_NAME": "your_db_name",
+        "DB_USER": "your_db_user",
+        "DB_PASSWORD": "your_db_password",
         "USE_KNOWLEDGE_GRAPH": "false",
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USER": "neo4j",

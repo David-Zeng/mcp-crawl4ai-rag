@@ -1,3 +1,4 @@
+
 """
 Utility functions for the Crawl4AI MCP server.
 """
@@ -5,7 +6,8 @@ import os
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import json
-from supabase import create_client, Client
+import psycopg2
+import asyncpg
 from urllib.parse import urlparse
 import openai
 import re
@@ -14,20 +16,35 @@ import time
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def get_supabase_client() -> Client:
+def get_db_conn():
     """
-    Get a Supabase client with the URL and key from environment variables.
+    Get a PostgreSQL database connection.
     
     Returns:
-        Supabase client instance
+        psycopg2 connection object
     """
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY")
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+    )
+
+async def get_async_db_conn():
+    """
+    Get an async PostgreSQL database connection.
     
-    if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment variables")
-    
-    return create_client(url, key)
+    Returns:
+        asyncpg connection object
+    """
+    return await asyncpg.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        database=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+    )
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
@@ -122,7 +139,7 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
 Here is the chunk we want to situate within the whole document 
 <chunk> 
 {chunk}
-</chunk> 
+</chunk>
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
         # Call the OpenAI API to generate contextual information
@@ -164,8 +181,7 @@ def process_chunk_with_context(args):
     url, content, full_document = args
     return generate_contextual_embedding(full_document, content)
 
-def add_documents_to_supabase(
-    client: Client, 
+def add_documents_to_db(
     urls: List[str], 
     chunk_numbers: List[int],
     contents: List[str], 
@@ -174,11 +190,10 @@ def add_documents_to_supabase(
     batch_size: int = 20
 ) -> None:
     """
-    Add documents to the Supabase crawled_pages table in batches.
+    Add documents to the crawled_pages table in batches.
     Deletes existing records with the same URLs before inserting to prevent duplicates.
     
     Args:
-        client: Supabase client
         urls: List of URLs
         chunk_numbers: List of chunk numbers
         contents: List of document contents
@@ -189,142 +204,141 @@ def add_documents_to_supabase(
     # Get unique URLs to delete existing records
     unique_urls = list(set(urls))
     
-    # Delete existing records for these URLs in a single operation
-    try:
-        if unique_urls:
-            # Use the .in_() filter to delete all records with matching URLs
-            client.table("crawled_pages").delete().in_("url", unique_urls).execute()
-    except Exception as e:
-        print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
-        # Fallback: delete records one by one
-        for url in unique_urls:
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            # Delete existing records for these URLs in a single operation
             try:
-                client.table("crawled_pages").delete().eq("url", url).execute()
-            except Exception as inner_e:
-                print(f"Error deleting record for URL {url}: {inner_e}")
-                # Continue with the next URL even if one fails
-    
-    # Check if MODEL_CHOICE is set for contextual embeddings
-    use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
-    print(f"\n\nUse contextual embeddings: {use_contextual_embeddings}\n\n")
-    
-    # Process in batches to avoid memory issues
-    for i in range(0, len(contents), batch_size):
-        batch_end = min(i + batch_size, len(contents))
-        
-        # Get batch slices
-        batch_urls = urls[i:batch_end]
-        batch_chunk_numbers = chunk_numbers[i:batch_end]
-        batch_contents = contents[i:batch_end]
-        batch_metadatas = metadatas[i:batch_end]
-        
-        # Apply contextual embedding to each chunk if MODEL_CHOICE is set
-        if use_contextual_embeddings:
-            # Prepare arguments for parallel processing
-            process_args = []
-            for j, content in enumerate(batch_contents):
-                url = batch_urls[j]
-                full_document = url_to_full_document.get(url, "")
-                process_args.append((url, content, full_document))
-            
-            # Process in parallel using ThreadPoolExecutor
-            contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                # Submit all tasks and collect results
-                future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
-                                for idx, arg in enumerate(process_args)}
-                
-                # Process results as they complete
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        result, success = future.result()
-                        contextual_contents.append(result)
-                        if success:
-                            batch_metadatas[idx]["contextual_embedding"] = True
-                    except Exception as e:
-                        print(f"Error processing chunk {idx}: {e}")
-                        # Use original content as fallback
-                        contextual_contents.append(batch_contents[idx])
-            
-            # Sort results back into original order if needed
-            if len(contextual_contents) != len(batch_contents):
-                print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
-                # Use original contents as fallback
-                contextual_contents = batch_contents
-        else:
-            # If not using contextual embeddings, use original contents
-            contextual_contents = batch_contents
-        
-        # Create embeddings for the entire batch at once
-        batch_embeddings = create_embeddings_batch(contextual_contents)
-        
-        batch_data = []
-        for j in range(len(contextual_contents)):
-            # Extract metadata fields
-            chunk_size = len(contextual_contents[j])
-            
-            # Extract source_id from URL
-            parsed_url = urlparse(batch_urls[j])
-            source_id = parsed_url.netloc or parsed_url.path
-            
-            # Prepare data for insertion
-            data = {
-                "url": batch_urls[j],
-                "chunk_number": batch_chunk_numbers[j],
-                "content": contextual_contents[j],  # Store original content
-                "metadata": {
-                    "chunk_size": chunk_size,
-                    **batch_metadatas[j]
-                },
-                "source_id": source_id,  # Add source_id field
-                "embedding": batch_embeddings[j]  # Use embedding from contextual content
-            }
-            
-            batch_data.append(data)
-        
-        # Insert batch into Supabase with retry logic
-        max_retries = 3
-        retry_delay = 1.0  # Start with 1 second delay
-        
-        for retry in range(max_retries):
-            try:
-                client.table("crawled_pages").insert(batch_data).execute()
-                # Success - break out of retry loop
-                break
+                if unique_urls:
+                    cur.execute("DELETE FROM crawled_pages WHERE url = ANY(%s)", (unique_urls,))
             except Exception as e:
-                if retry < max_retries - 1:
-                    print(f"Error inserting batch into Supabase (attempt {retry + 1}/{max_retries}): {e}")
-                    print(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
+                conn.rollback()
+                # Fallback: delete records one by one
+                for url in unique_urls:
+                    try:
+                        cur.execute("DELETE FROM crawled_pages WHERE url = %s", (url,))
+                    except Exception as inner_e:
+                        print(f"Error deleting record for URL {url}: {inner_e}")
+                        conn.rollback()
+                        # Continue with the next URL even if one fails
+            
+            # Check if MODEL_CHOICE is set for contextual embeddings
+            use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
+            print(f"\n\nUse contextual embeddings: {use_contextual_embeddings}\n\n")
+            
+            # Process in batches to avoid memory issues
+            for i in range(0, len(contents), batch_size):
+                batch_end = min(i + batch_size, len(contents))
+                
+                # Get batch slices
+                batch_urls = urls[i:batch_end]
+                batch_chunk_numbers = chunk_numbers[i:batch_end]
+                batch_contents = contents[i:batch_end]
+                batch_metadatas = metadatas[i:batch_end]
+                
+                # Apply contextual embedding to each chunk if MODEL_CHOICE is set
+                if use_contextual_embeddings:
+                    # Prepare arguments for parallel processing
+                    process_args = []
+                    for j, content in enumerate(batch_contents):
+                        url = batch_urls[j]
+                        full_document = url_to_full_document.get(url, "")
+                        process_args.append((url, content, full_document))
+                    
+                    # Process in parallel using ThreadPoolExecutor
+                    contextual_contents = []
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        # Submit all tasks and collect results
+                        future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
+                                        for idx, arg in enumerate(process_args)}
+                        
+                        # Process results as they complete
+                        for future in concurrent.futures.as_completed(future_to_idx):
+                            idx = future_to_idx[future]
+                            try:
+                                result, success = future.result()
+                                contextual_contents.append(result)
+                                if success:
+                                    batch_metadatas[idx]["contextual_embedding"] = True
+                            except Exception as e:
+                                print(f"Error processing chunk {idx}: {e}")
+                                # Use original content as fallback
+                                contextual_contents.append(batch_contents[idx])
+                    
+                    # Sort results back into original order if needed
+                    if len(contextual_contents) != len(batch_contents):
+                        print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
+                        # Use original contents as fallback
+                        contextual_contents = batch_contents
                 else:
-                    # Final attempt failed
-                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
+                    # If not using contextual embeddings, use original contents
+                    contextual_contents = batch_contents
+                
+                # Create embeddings for the entire batch at once
+                batch_embeddings = create_embeddings_batch(contextual_contents)
+                
+                batch_data = []
+                for j in range(len(contextual_contents)):
+                    # Extract metadata fields
+                    chunk_size = len(contextual_contents[j])
+                    
+                    # Extract source_id from URL
+                    parsed_url = urlparse(batch_urls[j])
+                    source_id = parsed_url.netloc or parsed_url.path
+                    
+                    # Prepare data for insertion
+                    data = (
+                        batch_urls[j],
+                        batch_chunk_numbers[j],
+                        contextual_contents[j],
+                        json.dumps({
+                            "chunk_size": chunk_size,
+                            **batch_metadatas[j]
+                        }),
+                        source_id,
+                        batch_embeddings[j]
+                    )
+                    
+                    batch_data.append(data)
+                
+                # Insert batch into the database
+                try:
+                    cur.executemany(
+                        "INSERT INTO crawled_pages (url, chunk_number, content, metadata, source_id, embedding) VALUES (%s, %s, %s, %s, %s, %s)",
+                        batch_data
+                    )
+                    conn.commit()
+                except Exception as e:
+                    print(f"Error inserting batch into the database: {e}")
+                    conn.rollback()
                     # Optionally, try inserting records one by one as a last resort
                     print("Attempting to insert records individually...")
                     successful_inserts = 0
                     for record in batch_data:
                         try:
-                            client.table("crawled_pages").insert(record).execute()
+                            cur.execute(
+                                "INSERT INTO crawled_pages (url, chunk_number, content, metadata, source_id, embedding) VALUES (%s, %s, %s, %s, %s, %s)",
+                                record
+                            )
+                            conn.commit()
                             successful_inserts += 1
                         except Exception as individual_error:
-                            print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
+                            print(f"Failed to insert individual record for URL {record[0]}: {individual_error}")
+                            conn.rollback()
                     
                     if successful_inserts > 0:
                         print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
 
-def search_documents(
-    client: Client, 
+async def search_documents(
     query: str, 
     match_count: int = 10, 
+    match_threshold: float = 0.5, # Added match_threshold
     filter_metadata: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for documents in Supabase using vector similarity.
+    Search for documents in the database using vector similarity.
     
     Args:
-        client: Supabase client
         query: Query text
         match_count: Maximum number of results to return
         filter_metadata: Optional metadata filter
@@ -335,24 +349,32 @@ def search_documents(
     # Create embedding for the query
     query_embedding = create_embedding(query)
     
-    # Execute the search using the match_crawled_pages function
+    conn = await get_async_db_conn()
     try:
+        # Convert the list embedding to a string representation for PostgreSQL vector type
+        query_embedding_str = str(query_embedding)
+
         # Only include filter parameter if filter_metadata is provided and not empty
-        params = {
-            'query_embedding': query_embedding,
-            'match_count': match_count
-        }
+        # Prepare the filter (jsonb) and source_filter (text) arguments for the SQL function
+        sql_filter_jsonb = json.dumps(filter_metadata) if filter_metadata else '{}'
+        sql_source_filter_text = None # Default to None (SQL NULL)
+
+        if filter_metadata and 'source' in filter_metadata:
+            sql_source_filter_text = filter_metadata['source']
+
+        # The params list for asyncpg.fetch should match the SQL function's arguments
+        # match_crawled_pages(query_embedding vector, match_count int, filter jsonb, source_filter text)
+        params = [query_embedding_str, match_count, sql_filter_jsonb, sql_source_filter_text]
+        sql_query = 'SELECT * FROM match_crawled_pages($1::vector, $2, $3, $4)'
+
         
-        # Only add the filter if it's actually provided and not empty
-        if filter_metadata:
-            params['filter'] = filter_metadata  # Pass the dictionary directly, not JSON-encoded
-        
-        result = client.rpc('match_crawled_pages', params).execute()
-        
-        return result.data
+        rows = await conn.fetch(sql_query, *params)
+        return [dict(row) for row in rows]
     except Exception as e:
         print(f"Error searching documents: {e}")
         return []
+    finally:
+        await conn.close()
 
 
 def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[Dict[str, Any]]:
@@ -485,8 +507,7 @@ Based on the code example and its surrounding context, provide a concise summary
         return "Code example for demonstration purposes."
 
 
-def add_code_examples_to_supabase(
-    client: Client,
+def add_code_examples_to_db(
     urls: List[str],
     chunk_numbers: List[int],
     code_examples: List[str],
@@ -495,10 +516,9 @@ def add_code_examples_to_supabase(
     batch_size: int = 20
 ):
     """
-    Add code examples to the Supabase code_examples table in batches.
+    Add code examples to the code_examples table in batches.
     
     Args:
-        client: Supabase client
         urls: List of URLs
         chunk_numbers: List of chunk numbers
         code_examples: List of code example contents
@@ -509,122 +529,122 @@ def add_code_examples_to_supabase(
     if not urls:
         return
         
-    # Delete existing records for these URLs
-    unique_urls = list(set(urls))
-    for url in unique_urls:
-        try:
-            client.table('code_examples').delete().eq('url', url).execute()
-        except Exception as e:
-            print(f"Error deleting existing code examples for {url}: {e}")
-    
-    # Process in batches
-    total_items = len(urls)
-    for i in range(0, total_items, batch_size):
-        batch_end = min(i + batch_size, total_items)
-        batch_texts = []
-        
-        # Create combined texts for embedding (code + summary)
-        for j in range(i, batch_end):
-            combined_text = f"{code_examples[j]}\n\nSummary: {summaries[j]}"
-            batch_texts.append(combined_text)
-        
-        # Create embeddings for the batch
-        embeddings = create_embeddings_batch(batch_texts)
-        
-        # Check if embeddings are valid (not all zeros)
-        valid_embeddings = []
-        for embedding in embeddings:
-            if embedding and not all(v == 0.0 for v in embedding):
-                valid_embeddings.append(embedding)
-            else:
-                print(f"Warning: Zero or invalid embedding detected, creating new one...")
-                # Try to create a single embedding as fallback
-                single_embedding = create_embedding(batch_texts[len(valid_embeddings)])
-                valid_embeddings.append(single_embedding)
-        
-        # Prepare batch data
-        batch_data = []
-        for j, embedding in enumerate(valid_embeddings):
-            idx = i + j
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            # Delete existing records for these URLs
+            unique_urls = list(set(urls))
+            for url in unique_urls:
+                try:
+                    cur.execute("DELETE FROM code_examples WHERE url = %s", (url,))
+                except Exception as e:
+                    print(f"Error deleting existing code examples for {url}: {e}")
+                    conn.rollback()
             
-            # Extract source_id from URL
-            parsed_url = urlparse(urls[idx])
-            source_id = parsed_url.netloc or parsed_url.path
-            
-            batch_data.append({
-                'url': urls[idx],
-                'chunk_number': chunk_numbers[idx],
-                'content': code_examples[idx],
-                'summary': summaries[idx],
-                'metadata': metadatas[idx],  # Store as JSON object, not string
-                'source_id': source_id,
-                'embedding': embedding
-            })
-        
-        # Insert batch into Supabase with retry logic
-        max_retries = 3
-        retry_delay = 1.0  # Start with 1 second delay
-        
-        for retry in range(max_retries):
-            try:
-                client.table('code_examples').insert(batch_data).execute()
-                # Success - break out of retry loop
-                break
-            except Exception as e:
-                if retry < max_retries - 1:
-                    print(f"Error inserting batch into Supabase (attempt {retry + 1}/{max_retries}): {e}")
-                    print(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    # Final attempt failed
-                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
+            # Process in batches
+            total_items = len(urls)
+            for i in range(0, total_items, batch_size):
+                batch_end = min(i + batch_size, total_items)
+                batch_texts = []
+                
+                # Create combined texts for embedding (code + summary)
+                for j in range(i, batch_end):
+                    combined_text = f"{code_examples[j]}\n\nSummary: {summaries[j]}"
+                    batch_texts.append(combined_text)
+                
+                # Create embeddings for the batch
+                embeddings = create_embeddings_batch(batch_texts)
+                
+                # Check if embeddings are valid (not all zeros)
+                valid_embeddings = []
+                for embedding in embeddings:
+                    if embedding and not all(v == 0.0 for v in embedding):
+                        valid_embeddings.append(embedding)
+                    else:
+                        print(f"Warning: Zero or invalid embedding detected, creating new one...")
+                        # Try to create a single embedding as fallback
+                        single_embedding = create_embedding(batch_texts[len(valid_embeddings)])
+                        valid_embeddings.append(single_embedding)
+                
+                # Prepare batch data
+                batch_data = []
+                for j, embedding in enumerate(valid_embeddings):
+                    idx = i + j
+                    
+                    # Extract source_id from URL
+                    parsed_url = urlparse(urls[idx])
+                    source_id = parsed_url.netloc or parsed_url.path
+                    
+                    batch_data.append((
+                        urls[idx],
+                        chunk_numbers[idx],
+                        code_examples[idx],
+                        summaries[idx],
+                        json.dumps(metadatas[idx]),
+                        source_id,
+                        embedding
+                    ))
+                
+                # Insert batch into the database
+                try:
+                    cur.executemany(
+                        "INSERT INTO code_examples (url, chunk_number, content, summary, metadata, source_id, embedding) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        batch_data
+                    )
+                    conn.commit()
+                except Exception as e:
+                    print(f"Error inserting batch into the database: {e}")
+                    conn.rollback()
                     # Optionally, try inserting records one by one as a last resort
                     print("Attempting to insert records individually...")
                     successful_inserts = 0
                     for record in batch_data:
                         try:
-                            client.table('code_examples').insert(record).execute()
+                            cur.execute(
+                                "INSERT INTO code_examples (url, chunk_number, content, summary, metadata, source_id, embedding) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                                record
+                            )
+                            conn.commit()
                             successful_inserts += 1
                         except Exception as individual_error:
-                            print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
+                            print(f"Failed to insert individual record for URL {record[0]}: {individual_error}")
+                            conn.rollback()
                     
                     if successful_inserts > 0:
                         print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
-        print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
+                print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
 
 
-def update_source_info(client: Client, source_id: str, summary: str, word_count: int):
+def update_source_info(source_id: str, summary: str, word_count: int):
     """
     Update or insert source information in the sources table.
     
     Args:
-        client: Supabase client
         source_id: The source ID (domain)
         summary: Summary of the source
         word_count: Total word count for the source
     """
-    try:
-        # Try to update existing source
-        result = client.table('sources').update({
-            'summary': summary,
-            'total_word_count': word_count,
-            'updated_at': 'now()'
-        }).eq('source_id', source_id).execute()
-        
-        # If no rows were updated, insert new source
-        if not result.data:
-            client.table('sources').insert({
-                'source_id': source_id,
-                'summary': summary,
-                'total_word_count': word_count
-            }).execute()
-            print(f"Created new source: {source_id}")
-        else:
-            print(f"Updated source: {source_id}")
-            
-    except Exception as e:
-        print(f"Error updating source {source_id}: {e}")
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                # Try to update existing source
+                cur.execute(
+                    "UPDATE sources SET summary = %s, total_word_count = %s, updated_at = now() WHERE source_id = %s",
+                    (summary, word_count, source_id)
+                )
+                
+                # If no rows were updated, insert new source
+                if cur.rowcount == 0:
+                    cur.execute(
+                        "INSERT INTO sources (source_id, summary, total_word_count) VALUES (%s, %s, %s)",
+                        (source_id, summary, word_count)
+                    )
+                    print(f"Created new source: {source_id}")
+                else:
+                    print(f"Updated source: {source_id}")
+                conn.commit()
+            except Exception as e:
+                print(f"Error updating source {source_id}: {e}")
+                conn.rollback()
 
 
 def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
@@ -687,18 +707,16 @@ The above content is from the documentation for '{source_id}'. Please provide a 
         return default_summary
 
 
-def search_code_examples(
-    client: Client, 
+async def search_code_examples(
     query: str, 
     match_count: int = 10, 
     filter_metadata: Optional[Dict[str, Any]] = None,
     source_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for code examples in Supabase using vector similarity.
+    Search for code examples in the database using vector similarity.
     
     Args:
-        client: Supabase client
         query: Query text
         match_count: Maximum number of results to return
         filter_metadata: Optional metadata filter
@@ -714,25 +732,29 @@ def search_code_examples(
     # Create embedding for the enhanced query
     query_embedding = create_embedding(enhanced_query)
     
-    # Execute the search using the match_code_examples function
+    conn = await get_async_db_conn()
     try:
         # Only include filter parameter if filter_metadata is provided and not empty
-        params = {
-            'query_embedding': query_embedding,
-            'match_count': match_count
-        }
+        params = [query_embedding, match_count]
+        sql_query = 'SELECT * FROM match_code_examples($1, $2, $3, $4)'
         
         # Only add the filter if it's actually provided and not empty
         if filter_metadata:
-            params['filter'] = filter_metadata
+            params.append(json.dumps(filter_metadata))
+        else:
+            params.append('{}')
             
         # Add source filter if provided
         if source_id:
-            params['source_filter'] = source_id
+            params.append(source_id)
+        else:
+            params.append(None)
+
         
-        result = client.rpc('match_code_examples', params).execute()
-        
-        return result.data
+        rows = await conn.fetch(sql_query, *params)
+        return [dict(row) for row in rows]
     except Exception as e:
         print(f"Error searching code examples: {e}")
         return []
+    finally:
+        await conn.close()
