@@ -351,9 +351,6 @@ async def search_documents(
     
     conn = await get_async_db_conn()
     try:
-        # Convert the list embedding to a string representation for PostgreSQL vector type
-        query_embedding_str = str(query_embedding)
-
         # Only include filter parameter if filter_metadata is provided and not empty
         # Prepare the filter (jsonb) and source_filter (text) arguments for the SQL function
         sql_filter_jsonb = json.dumps(filter_metadata) if filter_metadata else '{}'
@@ -364,8 +361,8 @@ async def search_documents(
 
         # The params list for asyncpg.fetch should match the SQL function's arguments
         # match_crawled_pages(query_embedding vector, match_count int, filter jsonb, source_filter text)
-        params = [query_embedding_str, match_count, sql_filter_jsonb, sql_source_filter_text]
-        sql_query = 'SELECT * FROM match_crawled_pages($1::vector, $2, $3, $4)'
+        params = [str(query_embedding), match_count, sql_filter_jsonb, sql_source_filter_text]
+        sql_query = 'SELECT * FROM match_crawled_pages($1, $2, $3, $4)'
 
         
         rows = await conn.fetch(sql_query, *params)
@@ -735,7 +732,7 @@ async def search_code_examples(
     conn = await get_async_db_conn()
     try:
         # Only include filter parameter if filter_metadata is provided and not empty
-        params = [query_embedding, match_count]
+        params = [str(query_embedding), match_count]
         sql_query = 'SELECT * FROM match_code_examples($1, $2, $3, $4)'
         
         # Only add the filter if it's actually provided and not empty

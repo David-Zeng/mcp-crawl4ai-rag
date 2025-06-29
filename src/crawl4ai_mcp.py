@@ -893,11 +893,13 @@ async def perform_rag_query(
                 # 2. Get keyword search results using ILIKE
                 keyword_query = "SELECT id, url, chunk_number, content, metadata, source_id FROM crawled_pages WHERE content ILIKE $1"
                 params = [f"%{query}%"]
+                param_index = 2
                 if source and source.strip():
-                    keyword_query += " AND source_id = $2"
+                    keyword_query += f" AND source_id = ${param_index}"
                     params.append(source)
+                    param_index += 1
 
-                keyword_query += " LIMIT $3"
+                keyword_query += f" LIMIT ${param_index}"
                 params.append(match_count * 2)
 
                 keyword_rows = await conn.fetch(keyword_query, *params)
@@ -1063,11 +1065,13 @@ async def search_code_examples(
                 # 2. Get keyword search results using ILIKE on both content and summary
                 keyword_query = "SELECT id, url, chunk_number, content, summary, metadata, source_id FROM code_examples WHERE content ILIKE $1 OR summary ILIKE $1"
                 params = [f"%{query}%"]
+                param_index = 2
                 if source_id and source_id.strip():
-                    keyword_query += " AND source_id = $2"
+                    keyword_query += f" AND source_id = ${param_index}"
                     params.append(source_id)
+                    param_index += 1
 
-                keyword_query += " LIMIT $3"
+                keyword_query += f" LIMIT ${param_index}"
                 params.append(match_count * 2)
 
                 keyword_rows = await conn.fetch(keyword_query, *params)
