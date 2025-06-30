@@ -71,7 +71,7 @@ A new MCP tool `insert_local_document` has been added to allow for the ingestion
 
 ```python
 await mcp.tool().insert_local_document(
-    file_path="/path/to/your/document.txt",
+    file_paths=["/path/to/your/document1.txt", "/path/to/your/document2.txt"],
     document_type="text", # or "code"
     source_id="my_local_docs" # Optional custom source ID
 )
